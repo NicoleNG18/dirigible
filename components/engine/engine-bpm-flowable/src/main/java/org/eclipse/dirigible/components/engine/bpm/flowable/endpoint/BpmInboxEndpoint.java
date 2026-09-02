@@ -150,13 +150,47 @@ public class BpmInboxEndpoint extends BaseEndpoint {
             bpmService.unclaimTask(taskId);
         } else if (COMPLETE.getActionName()
                            .equals(actionData.getAction())) {
-            bpmService.completeTask(taskId, actionData.getData());
+            try {
+                bpmService.completeTask(taskId, actionData.getData());
+            } catch (RuntimeException ex) {
+                // A synchronous document check (a generated repository's enforceChecks, e.g. intent
+                // `checks: itemsMin`) can fail while completing the task and roll the completion back.
+                // Surface the authored message to the acting user as a 400 - so the task form shows why
+                // and the task stays open - instead of letting it escape as an opaque 500 (#7014).
+                String message = validationMessage(ex);
+                if (message != null) {
+                    logger.debug("Task [{}] completion rejected by a document check: {}", taskId, message);
+                    return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                                         .body(message);
+                }
+                throw ex;
+            }
         } else {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                                  .body("Invalid action id provided [" + actionData.getAction() + "]");
         }
         return ResponseEntity.ok()
                              .build();
+    }
+
+    /**
+     * The message of a client SDK {@code ValidationException} anywhere in the cause chain, or
+     * {@code null} if none is present. Matched by fully-qualified name because the SDK type is loaded
+     * by the client class loader and is not on this platform module's classpath.
+     *
+     * @param ex the exception thrown by task completion
+     * @return the validation message to surface to the user, or null
+     */
+    private static String validationMessage(Throwable ex) {
+        Throwable current = ex;
+        for (int depth = 0; current != null && depth < 50; depth++) {
+            if ("org.eclipse.dirigible.sdk.db.ValidationException".equals(current.getClass()
+                                                                                 .getName())) {
+                return current.getMessage();
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     /**
