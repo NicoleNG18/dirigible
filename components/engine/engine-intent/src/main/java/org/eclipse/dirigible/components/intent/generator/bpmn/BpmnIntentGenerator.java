@@ -43,11 +43,13 @@ import org.eclipse.dirigible.components.intent.generator.NotifySupport;
 import org.eclipse.dirigible.components.intent.generator.SetFieldSupport;
 import org.eclipse.dirigible.components.intent.generator.StepEventSupport;
 import org.eclipse.dirigible.components.intent.generator.TriggerSupport;
+import org.eclipse.dirigible.components.intent.model.CheckIntent;
 import org.eclipse.dirigible.components.intent.model.EntityIntent;
 import org.eclipse.dirigible.components.intent.model.FieldIntent;
 import org.eclipse.dirigible.components.intent.model.IntentModel;
 import org.eclipse.dirigible.components.intent.model.PermissionIntent;
 import org.eclipse.dirigible.components.intent.model.ProcessIntent;
+import org.eclipse.dirigible.components.intent.model.RelationIntent;
 import org.eclipse.dirigible.components.intent.model.StepIntent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -179,6 +181,11 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
             }
         }
         Map<String, EntityIntent> byName = IntentEntities.byName(model);
+        // Handler classes of the status-setters that write a status guarded by a document check
+        // (itemsMin / itemsSumEqual). Their service task must run SYNCHRONOUSLY so a failing
+        // enforceChecks rolls back the user-task completion and the message reaches the acting user,
+        // instead of failing a detached async job that surfaces only as a process incident (#7014).
+        Set<String> syncSetterClasses = checkGatedSetterClasses(model, byName);
         // Extra candidate groups from the .settings (defaults to ADMINISTRATOR) appended to every user
         // task, so an administrator can always claim a task in addition to the task's own role.
         String candidateGroupsExtra = String.join(",", context.getSettings()
@@ -237,7 +244,76 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
                     render(process, rolesByLowerName, context.getProjectName(), IntentNaming.eventsPackage(context), processResolvers,
                             processFieldLoads, processTimerLoads, processStepEvents, ownFieldPascalCase(process, byName),
                             candidateGroupsExtra, writerByTask, setterByTask,
-                            IntentNaming.processTaskCatalog(context.getProjectName(), context)));
+                            IntentNaming.processTaskCatalog(context.getProjectName(), context), syncSetterClasses));
+        }
+    }
+
+    /**
+     * The generated handler classes of the status-setters whose target status is guarded by a document
+     * check ({@code itemsMin} / {@code itemsSumEqual}). Such a setter's service task must run
+     * synchronously (see {@link #appendServiceTask}), so that the failing {@code enforceChecks} rolls
+     * back the completing user-task transaction and the authored message reaches the acting user rather
+     * than a detached async job (#7014). Both an author-declared {@code setRelationField} serviceTask
+     * and an after-user-task setter resolve to the same class name, so one set covers both.
+     */
+    private static Set<String> checkGatedSetterClasses(IntentModel model, Map<String, EntityIntent> byName) {
+        Set<String> classes = new HashSet<>();
+        for (SetFieldSupport.Setter setter : SetFieldSupport.setters(model)) {
+            if (!setter.relation()) {
+                continue; // only a status FK write (setRelationField) can be gated by a document check
+            }
+            EntityIntent entity = byName.get(setter.entity());
+            if (entity == null) {
+                continue;
+            }
+            RelationIntent statusRelation = entityStatusRelation(entity);
+            if (statusRelation == null || !IntentNaming.pascalCase(statusRelation.getName())
+                                                       .equals(setter.field())) {
+                continue; // the setter does not write this entity's EntityStatus relation
+            }
+            Integer value = parseStatusValue(setter.value());
+            if (value != null && documentCheckGatedStatuses(entity).contains(value)) {
+                classes.add(setter.className());
+            }
+        }
+        return classes;
+    }
+
+    /** The status ids a document-level check ({@code itemsMin} / {@code itemsSumEqual}) gates on. */
+    private static Set<Integer> documentCheckGatedStatuses(EntityIntent entity) {
+        Set<Integer> gated = new HashSet<>();
+        if (entity.getChecks() == null) {
+            return gated;
+        }
+        for (CheckIntent check : entity.getChecks()) {
+            if (("itemsMin".equals(check.getKind()) || "itemsSumEqual".equals(check.getKind())) && check.getStatus() != null) {
+                gated.add(check.getStatus());
+            }
+        }
+        return gated;
+    }
+
+    /** The entity's {@code function: EntityStatus} relation, or {@code null} if it declares none. */
+    private static RelationIntent entityStatusRelation(EntityIntent entity) {
+        if (entity.getRelations() == null) {
+            return null;
+        }
+        for (RelationIntent relation : entity.getRelations()) {
+            if (relation.isEntityStatus()) {
+                return relation;
+            }
+        }
+        return null;
+    }
+
+    private static Integer parseStatusValue(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 
@@ -306,7 +382,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
     private static String render(ProcessIntent process, Map<String, String> rolesByLowerName, String projectName, String eventsPackage,
             List<Resolver> resolvers, List<FieldLoad> fieldLoads, List<TimerLoad> timerLoads, List<StepEventSupport.Emitter> stepEvents,
             Map<String, String> ownFieldPascalCase, String candidateGroupsExtra, Map<String, String> writerByTask,
-            Map<String, String> setterByTask, String taskLabelCatalog) {
+            Map<String, String> setterByTask, String taskLabelCatalog, Set<String> syncSetterClasses) {
         // Insert each resolver service task before its anchor step (the earliest decision or user-task
         // form that needs it) and rewrite the decision conditions - on a COPY of the step list, never
         // mutating the shared model (the glue generator runs after this one and must still see the
@@ -447,7 +523,8 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
                                               .isBlank()) {
                 continue;
             }
-            appendStepElement(sb, step, rolesByLowerName, projectName, processId, eventsPackage, candidateGroupsExtra, clearsByStep);
+            appendStepElement(sb, step, rolesByLowerName, projectName, processId, eventsPackage, candidateGroupsExtra, clearsByStep,
+                    syncSetterClasses);
         }
         for (BoundaryTimer timer : boundaryTimers) {
             appendBoundaryTimer(sb, timer);
@@ -459,7 +536,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
           .append(END_ID)
           .append("\"></endEvent>\n");
         if (hasAbort) {
-            appendAbortHandler(sb, processId, abortThenStep, projectName, eventsPackage, clearsByStep);
+            appendAbortHandler(sb, processId, abortThenStep, projectName, eventsPackage, clearsByStep, syncSetterClasses);
         }
         writeSequenceFlows(sb, flows);
         sb.append("  </process>\n");
@@ -579,7 +656,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
      * the interruption in an event subprocess avoids wrapping the main flow in a subprocess.
      */
     private static void appendAbortHandler(StringBuilder sb, String processId, StepIntent cleanup, String projectName, String eventsPackage,
-            Map<String, List<String>> clearsByStep) {
+            Map<String, List<String>> clearsByStep, Set<String> syncSetterClasses) {
         String startId = abortStartId(processId);
         String endId = abortEndId(processId);
         sb.append("    <subProcess id=\"")
@@ -596,7 +673,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
         sb.append("      </startEvent>\n");
         String afterStart = endId;
         if (cleanup != null) {
-            appendServiceTask(sb, cleanup, projectName, processId, eventsPackage, clearsFor(cleanup, clearsByStep));
+            appendServiceTask(sb, cleanup, projectName, processId, eventsPackage, clearsFor(cleanup, clearsByStep), syncSetterClasses);
             afterStart = cleanup.getName();
         }
         sb.append("      <endEvent id=\"")
@@ -883,7 +960,8 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
     }
 
     private static void appendStepElement(StringBuilder sb, StepIntent step, Map<String, String> rolesByLowerName, String projectName,
-            String processName, String eventsPackage, String candidateGroupsExtra, Map<String, List<String>> clearsByStep) {
+            String processName, String eventsPackage, String candidateGroupsExtra, Map<String, List<String>> clearsByStep,
+            Set<String> syncSetterClasses) {
         String kind = step.getKind() == null ? "userTask" : step.getKind();
         List<String> clears = clearsFor(step, clearsByStep);
         switch (kind) {
@@ -892,7 +970,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
                 break;
             case "serviceTask":
             case "script":
-                appendServiceTask(sb, step, projectName, processName, eventsPackage, clears);
+                appendServiceTask(sb, step, projectName, processName, eventsPackage, clears, syncSetterClasses);
                 break;
             case "decision":
                 appendExclusiveGateway(sb, step);
@@ -986,7 +1064,7 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
     }
 
     private static void appendServiceTask(StringBuilder sb, StepIntent step, String projectName, String processName, String eventsPackage,
-            List<String> clears) {
+            List<String> clears, Set<String> syncSetterClasses) {
         // Five service-task shapes:
         // - a generator-synthesized resolver carries a javaHandler (a client JavaDelegate FQN) -> JavaTask;
         // - an author-declared serviceTask with a `setField` -> JavaTask bound to the <events
@@ -1035,11 +1113,17 @@ public class BpmnIntentGenerator implements IntentTargetGenerator {
             java = true;
             handlerValue = "custom." + IntentNaming.pascalCase(step.getName());
         }
+        // A status-setter whose target status is guarded by a document check runs SYNCHRONOUSLY, so a
+        // failing enforceChecks rolls back the completing user-task transaction and the message reaches
+        // the acting user, instead of failing a detached async job (a process incident) with no user
+        // feedback (#7014). Every other service task stays async (long chains, resilient retries).
+        String handlerSimpleName = handlerValue == null ? "" : handlerValue.substring(handlerValue.lastIndexOf('.') + 1);
+        boolean async = !syncSetterClasses.contains(handlerSimpleName);
         sb.append("    <serviceTask id=\"")
           .append(escapeXmlAttribute(step.getName()))
           .append("\" name=\"")
           .append(escapeXmlAttribute(IntentNaming.humanize(step.getName())))
-          .append("\" flowable:async=\"true\" flowable:delegateExpression=\"")
+          .append(async ? "\" flowable:async=\"true\" flowable:delegateExpression=\"" : "\" flowable:delegateExpression=\"")
           .append(java ? "${JavaTask}" : "${JSTask}")
           .append("\">\n");
         boolean hasHandler = handlerValue != null && !handlerValue.isBlank();
