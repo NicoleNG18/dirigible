@@ -4067,9 +4067,16 @@ public final class IntentParser {
             return;
         }
         if ("itemsSumEqual".equals(kind) || "itemsMin".equals(kind)) {
-            EntityIntent items = compositionChildOf(entity, byName);
+            EntityIntent items = compositionChildOf(entity, byName, check.getEntity());
             if (items == null) {
-                issues.add(subject + " requires the entity to own a composition child (the document's items)");
+                if (check.getEntity() != null && !check.getEntity()
+                                                       .isBlank()) {
+                    issues.add(
+                            subject + " `entity` [" + check.getEntity() + "] must name a composition child of [" + entity.getName() + "]");
+                } else {
+                    issues.add(subject + " requires the entity to own a composition child (the document's items)"
+                            + " - if it owns several, name the line-items child with `entity:`");
+                }
                 return;
             }
             if (check.getStatus() == null || check.getStatus() <= 0) {
@@ -4155,8 +4162,20 @@ public final class IntentParser {
 
     /** The entity's composition child (the first entity declaring a composition to-one back to it). */
     private static EntityIntent compositionChildOf(EntityIntent entity, java.util.Map<String, EntityIntent> byName) {
+        return compositionChildOf(entity, byName, null);
+    }
+
+    /**
+     * The composition child of {@code entity}. With {@code preferredName} it must be that named child
+     * (a document with several composition collections names which one is the line items); without it,
+     * the first composition child declared. Returns {@code null} if none matches.
+     */
+    private static EntityIntent compositionChildOf(EntityIntent entity, java.util.Map<String, EntityIntent> byName, String preferredName) {
         for (EntityIntent candidate : byName.values()) {
             if (candidate.getRelations() == null) {
+                continue;
+            }
+            if (preferredName != null && !preferredName.isBlank() && !preferredName.equals(candidate.getName())) {
                 continue;
             }
             for (RelationIntent relation : candidate.getRelations()) {

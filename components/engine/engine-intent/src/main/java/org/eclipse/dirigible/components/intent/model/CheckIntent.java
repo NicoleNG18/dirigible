@@ -27,6 +27,14 @@ import java.util.List;
 public class CheckIntent {
 
     private String kind;
+    /**
+     * {@code itemsMin} / {@code itemsSumEqual} (optional): the composition child the check counts /
+     * sums over. Required only when the entity owns MORE THAN ONE composition child (e.g. a document
+     * with both line items and an optional payment-allocation collection) - otherwise the check would
+     * bind to whichever composition child is declared first and could count the wrong, optional one.
+     * Omitted = the entity's sole composition child.
+     */
+    private String entity;
     /** {@code exactlyOne}: the record's own fields, exactly one of which must be non-null. */
     private List<String> fields;
     /** {@code itemsSumEqual}: the two numeric item fields whose sums must be equal. */
@@ -83,6 +91,14 @@ public class CheckIntent {
 
     public String getKind() {
         return kind;
+    }
+
+    public String getEntity() {
+        return entity;
+    }
+
+    public void setEntity(String entity) {
+        this.entity = entity;
     }
 
     public String getOutcome() {

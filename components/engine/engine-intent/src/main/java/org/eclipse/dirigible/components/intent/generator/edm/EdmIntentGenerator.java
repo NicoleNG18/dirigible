@@ -1952,10 +1952,18 @@ public class EdmIntentGenerator implements IntentTargetGenerator {
                                             .map(IntentNaming::pascalCase)
                                             .toList());
             } else {
+                // The composition child the check counts / sums over. `entity:` names it when the master
+                // owns several composition collections (line items plus, say, an optional payment
+                // allocation) - otherwise the first composition child, which could be the wrong, optional
+                // one. The parser has already validated a named `entity:` is a composition child.
+                String preferred = check.getEntity();
                 EntityIntent items = null;
                 String itemsFk = null;
                 for (EntityIntent candidate : byName.values()) {
                     if (candidate.getRelations() == null) {
+                        continue;
+                    }
+                    if (preferred != null && !preferred.isBlank() && !preferred.equals(candidate.getName())) {
                         continue;
                     }
                     for (RelationIntent relation : candidate.getRelations()) {
