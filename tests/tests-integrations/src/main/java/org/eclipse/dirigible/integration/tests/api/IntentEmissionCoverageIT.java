@@ -4880,6 +4880,134 @@ class IntentEmissionCoverageIT extends IntegrationTest {
         assertResolveTransitionRuntime();
         assertGeneratesStepAxisRuntime();
         assertGeneratesItemsRuleRuntime();
+        assertCompositionCascadeAndRefuse();
+    }
+
+    /**
+     * Composition cascade (#7100) and its refuse counterpart (#7183), EXECUTED rather than grepped. The
+     * source-text assertions above pin that the generated repository emits {@code deleteOwnedChildren}
+     * with the refuse checks ahead of the first cascade, but nothing drove a delete - so whether a
+     * master's delete actually sweeps its cascading children away, whether a {@code whenMasterDeleted:
+     * refuse} child actually blocks it (400, the authored message), and whether the refusal is decided
+     * BEFORE the first cascade (so a sibling that would cascade is NOT swept when the delete is going
+     * to be refused anyway) were all unobserved. All three are driven here against the published app -
+     * the behaviour the earlier {@code indexOf(...)} ordering assertion could only restate (issue
+     * #7162).
+     */
+    private void assertCompositionCascadeAndRefuse() {
+        // (1) A DRAFT Entry with one EntryLine: deleting the master cascades the line away. EntryLine is a
+        // plain composition child (default cascade), so its rows go with the master - through the child's
+        // own repository, which is also what fires the child's -deleted event.
+        AtomicInteger cascadeEntry = new AtomicInteger();
+        restAssuredExecutor.execute(() -> cascadeEntry.set(given().contentType("application/json")
+                                                                  .body("{\"Date\":\"2026-02-01\",\"Account\":2}")
+                                                                  .when()
+                                                                  .post(API + "/entry/EntryController")
+                                                                  .then()
+                                                                  .statusCode(200)
+                                                                  .extract()
+                                                                  .path("Id")));
+        restAssuredExecutor.execute(() -> given().contentType("application/json")
+                                                 .body("{\"Entry\":" + cascadeEntry.get() + ",\"Debit\":50}")
+                                                 .when()
+                                                 .post(API + "/entry/EntryLineController")
+                                                 .then()
+                                                 .statusCode(200));
+        // The child is there before the delete...
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryLineController")
+                                                 .then()
+                                                 .statusCode(200)
+                                                 .body("findAll { it.Entry == " + cascadeEntry.get() + " }", hasSize(1)));
+        // ...the master deletes (DRAFT, so immutableWhen does not block)...
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .delete(API + "/entry/EntryController/" + cascadeEntry.get())
+                                                 .then()
+                                                 .statusCode(200));
+        // ...and the line is gone with it, and so is the master.
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryLineController")
+                                                 .then()
+                                                 .statusCode(200)
+                                                 .body("findAll { it.Entry == " + cascadeEntry.get() + " }", hasSize(0)));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryController/" + cascadeEntry.get())
+                                                 .then()
+                                                 .statusCode(404));
+
+        // (2) A DRAFT Entry with one EntryCopy: the copy declares whenMasterDeleted: refuse, so the
+        // master's delete is refused (a repository ValidationException -> 400 with the authored message)
+        // and both rows stay.
+        AtomicInteger refuseEntry = new AtomicInteger();
+        restAssuredExecutor.execute(() -> refuseEntry.set(given().contentType("application/json")
+                                                                 .body("{\"Date\":\"2026-02-02\",\"Account\":2}")
+                                                                 .when()
+                                                                 .post(API + "/entry/EntryController")
+                                                                 .then()
+                                                                 .statusCode(200)
+                                                                 .extract()
+                                                                 .path("Id")));
+        restAssuredExecutor.execute(() -> given().contentType("application/json")
+                                                 .body("{\"Entry\":" + refuseEntry.get() + ",\"Note\":\"printed copy\"}")
+                                                 .when()
+                                                 .post(API + "/entry/EntryCopyController")
+                                                 .then()
+                                                 .statusCode(200));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .delete(API + "/entry/EntryController/" + refuseEntry.get())
+                                                 .then()
+                                                 .statusCode(400)
+                                                 .body("message", containsString("still has")));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryController/" + refuseEntry.get())
+                                                 .then()
+                                                 .statusCode(200));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryCopyController")
+                                                 .then()
+                                                 .statusCode(200)
+                                                 .body("findAll { it.Entry == " + refuseEntry.get() + " }", hasSize(1)));
+
+        // (3) #7183: the refusal is decided BEFORE the first cascade. A DRAFT Entry carrying BOTH a
+        // cascading EntryLine AND a refusing EntryCopy: the delete is refused, and the line MUST survive.
+        // A delete that swept the line first and only then threw would leave the master with a partial
+        // line set - and, because History writes on its own connection, a permanent delete row for a line
+        // that still exists. The line still being here is the behavioural proof the earlier indexOf(...)
+        // assertion only restated.
+        AtomicInteger mixedEntry = new AtomicInteger();
+        restAssuredExecutor.execute(() -> mixedEntry.set(given().contentType("application/json")
+                                                                .body("{\"Date\":\"2026-02-03\",\"Account\":2}")
+                                                                .when()
+                                                                .post(API + "/entry/EntryController")
+                                                                .then()
+                                                                .statusCode(200)
+                                                                .extract()
+                                                                .path("Id")));
+        restAssuredExecutor.execute(() -> given().contentType("application/json")
+                                                 .body("{\"Entry\":" + mixedEntry.get() + ",\"Debit\":50}")
+                                                 .when()
+                                                 .post(API + "/entry/EntryLineController")
+                                                 .then()
+                                                 .statusCode(200));
+        restAssuredExecutor.execute(() -> given().contentType("application/json")
+                                                 .body("{\"Entry\":" + mixedEntry.get() + ",\"Note\":\"printed copy\"}")
+                                                 .when()
+                                                 .post(API + "/entry/EntryCopyController")
+                                                 .then()
+                                                 .statusCode(200));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .delete(API + "/entry/EntryController/" + mixedEntry.get())
+                                                 .then()
+                                                 .statusCode(400));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryLineController")
+                                                 .then()
+                                                 .statusCode(200)
+                                                 .body("findAll { it.Entry == " + mixedEntry.get() + " }", hasSize(1)));
+        restAssuredExecutor.execute(() -> given().when()
+                                                 .get(API + "/entry/EntryController/" + mixedEntry.get())
+                                                 .then()
+                                                 .statusCode(200));
     }
 
     /**
